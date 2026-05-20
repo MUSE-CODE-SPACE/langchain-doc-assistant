@@ -1,0 +1,91 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "langchain-doc-assistant"
+version = "0.2.0"
+description = "LangChain-powered intelligent document processing and Q&A system with RAG."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Yoon K." }]
+keywords = ["langchain", "rag", "documents", "flask", "ai", "agent"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: Flask",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "langchain>=0.3.0,<0.4",
+    "langchain-core>=0.3.0,<0.4",
+    "langchain-community>=0.3.0,<0.4",
+    "langchain-openai>=0.2.0,<0.3",
+    "langchain-anthropic>=0.3.0,<0.4",
+    "flask>=3.1.0,<4",
+    "flask-cors>=5.0.0,<6",
+    "pydantic>=2.10.0,<3",
+    "python-dotenv>=1.0.0,<2",
+    "numpy>=1.26.0",
+    "pypdf>=4.0.0",
+    "python-docx>=1.1.0",
+    "openpyxl>=3.1.0",
+    "beautifulsoup4>=4.12.0",
+    "markdown>=3.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=5.0.0",
+    "ruff>=0.7.0",
+    "mypy>=1.11.0",
+]
+server = [
+    "gunicorn>=23.0.0",
+]
+rag = [
+    "langchain-chroma>=0.1.0",
+    "chromadb>=0.5.0",
+    "faiss-cpu>=1.9.0",
+    "sentence-transformers>=3.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/yoon-k/langchain-doc-assistant"
+Repository = "https://github.com/yoon-k/langchain-doc-assistant"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+exclude = ["tests*", "docs*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+filterwarnings = [
+    "ignore::DeprecationWarning:pydantic.*",
+]
+
+[tool.mypy]
+python_version = "3.12"
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+check_untyped_defs = true
+strict_optional = true

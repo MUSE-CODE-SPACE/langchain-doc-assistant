@@ -1,6 +1,6 @@
 # Smart Document Assistant
 
-LangChain-powered intelligent document processing and Q&A system.
+LangChain-powered intelligent document processing and Q&A system with RAG.
 
 ## Live Demo
 
@@ -8,132 +8,129 @@ LangChain-powered intelligent document processing and Q&A system.
 
 ## Features
 
-- **Multi-Format Processing**: PDF, DOCX, TXT, Markdown, CSV support
-- **Intelligent Search**: Semantic and keyword-based document search
-- **Question Answering**: RAG-based Q&A with source citations
+- **Multi-Format Processing**: PDF, DOCX, TXT, Markdown, CSV, XLSX, HTML support
+- **Hybrid Search**: Vector similarity (Chroma / FAISS / in-memory) and keyword fallback
+- **RAG Question Answering**: LCEL pipeline with source citations
 - **Summarization**: Extractive document summarization
-- **Entity Extraction**: Extract people, organizations, dates, emails, URLs
-- **Document Comparison**: Compare documents for similarities and differences
+- **Entity Extraction**: People, organizations, dates, emails, URLs, phone numbers
+- **Document Comparison**: Token-overlap similarity with shared/unique terms
+- **Pluggable LLM**: Anthropic (default) or OpenAI, with keyword-router fallback when no keys are present
+- **Switchable vector backend**: `VECTOR_STORE=in_memory|chroma|faiss`
 
 ## Architecture
 
 ```
 langchain-doc-assistant/
 ├── app/
-│   ├── agents/
-│   │   └── document_agent.py      # Main LangChain agent
-│   ├── chains/
-│   │   └── qa_chain.py            # Question answering chains
-│   ├── processors/
-│   │   └── document_processor.py  # Document parsing and chunking
-│   ├── tools/
-│   │   └── document_tools.py      # Custom LangChain tools
-│   └── api.py                     # Flask API
-├── static/
-├── templates/
-└── docs/                          # GitHub Pages demo
-```
-
-## LangChain Components
-
-### Document Processors
-- `TextDocumentProcessor`: Plain text files
-- `MarkdownProcessor`: Markdown with section extraction
-- `PDFProcessor`: PDF with page-aware chunking
-- `DocxProcessor`: Word documents with table extraction
-- `CSVProcessor`: Tabular data processing
-
-### Custom Tools
-```python
-from app.tools.document_tools import get_document_tools
-
-tools = get_document_tools()
-# SearchDocumentsTool - Search across documents
-# SummarizeDocumentTool - Generate summaries
-# ExtractEntitiesTool - Extract named entities
-# AnswerQuestionTool - Answer questions
-# ListDocumentsTool - List uploaded documents
-# CompareDocumentsTool - Compare two documents
-```
-
-### QA Chains
-```python
-from app.chains.qa_chain import create_qa_chain
-
-# Simple extractive QA
-qa = create_qa_chain(chain_type="simple")
-result = qa.answer("What are the main conclusions?")
-
-# Multi-hop QA for complex questions
-qa = create_qa_chain(chain_type="multi_hop")
-result = qa.answer("Compare the findings from section 2 and section 5")
-
-# Conversational QA with history
-qa = create_qa_chain(chain_type="conversational")
-qa.answer("What is the budget?")
-qa.answer("Who approved it?")  # Resolves 'it' to 'budget'
-```
-
-### Agent Usage
-```python
-from app.agents.document_agent import create_document_agent
-
-agent = create_document_agent()
-
-# Upload document
-with open("report.pdf", "rb") as f:
-    agent.upload_document(f.read(), "report.pdf")
-
-# Chat with the agent
-response = agent.chat("Summarize the main findings")
-response = agent.chat("Who are the key stakeholders mentioned?")
-response = agent.chat("Search for budget information")
+│   ├── agents/document_agent.py     # LCEL tool-calling agent + fallback
+│   ├── chains/qa_chain.py           # LCEL RAG pipeline + vector backends
+│   ├── processors/document_processor.py  # PDF / DOCX / TXT / MD / CSV / XLSX / HTML
+│   ├── tools/document_tools.py      # BaseTool subclasses with args_schema
+│   └── api.py                       # Flask app factory
+├── tests/test_smoke.py              # Boots the app via factory
+├── pyproject.toml                   # uv / pip install -e ".[dev,rag]"
+├── Dockerfile, .dockerignore
+├── Makefile
+└── .github/workflows/ci.yml         # Ruff + pytest, no [rag] needed
 ```
 
 ## Installation
 
 ```bash
-git clone https://github.com/yoon-k/langchain-doc-assistant.git
+git clone https://github.com/MUSE-CODE-SPACE/langchain-doc-assistant.git
 cd langchain-doc-assistant
 
-python -m venv venv
-source venv/bin/activate
+# Base install (fast; no ML deps)
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
 
-pip install -r requirements.txt
-
-# Optional: Set OpenAI API key for LLM features
-export OPENAI_API_KEY=your_key_here
-
-python -m app.api
+# Optional full RAG stack (Chroma + FAISS + sentence-transformers)
+pip install -e ".[dev,rag]"
 ```
 
-## API Endpoints
+Or with [uv](https://github.com/astral-sh/uv):
+
+```bash
+uv venv && source .venv/bin/activate
+uv pip install -e ".[dev,rag]"
+```
+
+## Running
+
+```bash
+# Dev server (Flask)
+python -m app.api
+# or via Makefile
+make dev
+
+# Production (gunicorn)
+gunicorn --bind 0.0.0.0:5000 --workers 2 app.api:app
+```
+
+### Docker
+
+```bash
+make docker-build      # builds doc-assistant:dev
+make docker-run        # runs on PORT=5000
+```
+
+## Configuration
+
+Copy `.env.example` to `.env` and fill in any values you need:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LLM_PROVIDER` | auto-detect | `anthropic`, `openai`, or `none` |
+| `ANTHROPIC_API_KEY` | — | Required for `anthropic` provider |
+| `ANTHROPIC_MODEL` | `claude-haiku-4-5-20251001` | Override model |
+| `OPENAI_API_KEY` | — | Required for `openai` provider |
+| `OPENAI_MODEL` | `gpt-4o-mini` | Override model |
+| `VECTOR_STORE` | `in_memory` | `in_memory`, `chroma`, `faiss` |
+| `CHROMA_PERSIST_DIR` | `./chroma_db` | Where Chroma writes |
+| `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | sentence-transformers model |
+| `PORT` | `5000` | HTTP port |
+| `FLASK_DEBUG` | `1` | Dev-server debug flag |
+
+When neither `ANTHROPIC_API_KEY` nor `OPENAI_API_KEY` is set the assistant runs
+its built-in keyword router and the RAG chain returns extractive answers - so
+the demo and CI keep working with no external network calls.
+
+## API
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/chat` | POST | Chat with the document assistant |
-| `/api/documents/upload` | POST | Upload a document |
-| `/api/documents` | GET | List all documents |
-| `/api/documents/<id>` | DELETE | Delete a document |
+| `/` | GET | Index / static demo |
+| `/api/health` | GET | Service status + `llm_enabled` |
+| `/api/chat` | POST | Agent chat: `{session_id, message}` |
+| `/api/documents` | GET | List uploaded documents |
+| `/api/documents` | POST | Upload (multipart form, field `file`) |
+| `/api/documents/<doc_id>` | GET | Document metadata |
+| `/api/documents/<doc_id>` | DELETE | Remove document |
+| `/api/documents/<doc_id>/active` | POST | Set active document for the session |
+| `/api/query` | POST | RAG query: `{question, document_id?}` |
+| `/api/session/reset` | POST | Reset a session's conversation state |
 
-## Supported File Types
+## Tooling
 
-| Type | Extension | Features |
-|------|-----------|----------|
-| PDF | .pdf | Page extraction, metadata |
-| Word | .docx | Paragraphs, tables |
-| Text | .txt | Full text |
-| Markdown | .md | Sections, headers |
-| CSV | .csv | Row-based chunking |
+```bash
+make test         # pytest
+make lint         # ruff check
+make format       # ruff format + ruff check --fix
+make clean        # remove venv + caches
+```
+
+CI (GitHub Actions) installs the base `[dev]` extras (no `[rag]`) and runs
+`ruff check` + `pytest`.
 
 ## Tech Stack
 
-- **LangChain**: Agent and tool framework
-- **PyPDF**: PDF processing
-- **python-docx**: Word document parsing
-- **ChromaDB**: Vector storage (optional)
-- **Sentence Transformers**: Embeddings
-- **Flask**: API server
+- **LangChain 0.3** (`langchain`, `langchain-core`, `langchain-community`)
+- **LLMs**: `langchain-anthropic`, `langchain-openai`
+- **Vector stores**: in-memory cosine (numpy), `langchain-chroma`, FAISS (optional)
+- **Embeddings**: `FakeEmbeddings` (default) or HuggingFace sentence-transformers
+- **Doc parsing**: `pypdf`, `python-docx`, `openpyxl`, `beautifulsoup4`, `markdown`
+- **Web**: Flask 3 + flask-cors, gunicorn (server extras)
 
 ## License
 

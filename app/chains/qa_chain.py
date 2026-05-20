@@ -1,438 +1,349 @@
 """
-Question Answering Chain - Advanced QA with retrieval
+Retrieval-augmented Question Answering chain.
+
+This module builds an LCEL pipeline of the form::
+
+    {context, question} -> prompt -> llm -> StrOutputParser
+
+The retriever is backed by one of three vector store implementations, selected
+via the ``VECTOR_STORE`` env var (default ``in_memory``):
+
+* ``in_memory`` - numpy-based cosine similarity over chunk vectors. Uses
+  ``FakeEmbeddings`` so no ML model is required; perfect for tests.
+* ``chroma`` - persisted ``langchain_chroma.Chroma`` collection (optional
+  ``[rag]`` extras).
+* ``faiss`` - ``langchain_community.vectorstores.FAISS`` (optional ``[rag]``
+  extras + ``faiss-cpu``).
+
+When no LLM is configured, the chain falls back to an extractive keyword-based
+answerer so the chain still returns useful results in tests and offline demos.
 """
 
-import re
-from typing import List, Dict, Any, Optional
-from dataclasses import dataclass
-from langchain.prompts import ChatPromptTemplate, PromptTemplate
-from langchain.schema.runnable import RunnablePassthrough
+from __future__ import annotations
 
-from app.processors.document_processor import DocumentChunk, ProcessedDocument
+import logging
+import os
+import re
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
+
+from langchain_core.documents import Document
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableLambda, RunnablePassthrough
+
 from app.tools.document_tools import document_store
 
+if TYPE_CHECKING:
+    from langchain_core.embeddings import Embeddings
+    from langchain_core.language_models import BaseChatModel
+    from langchain_core.vectorstores import VectorStore
 
+logger = logging.getLogger(__name__)
+
+
+DEFAULT_EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+DEFAULT_CHROMA_DIR = "./chroma_db"
+
+
+# ---------------------------------------------------------------------------
+# Result type
+# ---------------------------------------------------------------------------
 @dataclass
 class QAResult:
     """Question answering result."""
+
     question: str
     answer: str
     confidence: float
-    sources: List[Dict[str, Any]]
-    reasoning: Optional[str] = None
+    sources: list[dict[str, Any]] = field(default_factory=list)
+    reasoning: str | None = None
 
 
+# ---------------------------------------------------------------------------
+# Embedding + vector store selection
+# ---------------------------------------------------------------------------
+def _resolve_backend() -> str:
+    """Return the configured vector backend name (lowercased)."""
+    return (os.environ.get("VECTOR_STORE") or "in_memory").strip().lower()
+
+
+def _resolve_embeddings(backend: str) -> Embeddings:
+    """Construct an embeddings object appropriate for the backend."""
+    # in_memory uses FakeEmbeddings so tests don't need to download models.
+    if backend == "in_memory":
+        from langchain_community.embeddings import FakeEmbeddings
+
+        return FakeEmbeddings(size=64)
+
+    # For real backends, prefer sentence-transformers when available.
+    try:
+        from langchain_community.embeddings import HuggingFaceEmbeddings
+
+        model_name = os.environ.get("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
+        return HuggingFaceEmbeddings(model_name=model_name)
+    except Exception as exc:
+        logger.warning(
+            "HuggingFaceEmbeddings unavailable (%s); using FakeEmbeddings.", exc
+        )
+        from langchain_community.embeddings import FakeEmbeddings
+
+        return FakeEmbeddings(size=64)
+
+
+def _build_vector_store(
+    documents: list[Document], embeddings: Embeddings, backend: str
+) -> VectorStore | None:
+    """Build a real (chroma/faiss) vector store, or None for in_memory."""
+    if backend == "chroma":
+        try:
+            from langchain_chroma import Chroma  # type: ignore
+
+            persist_dir = os.environ.get("CHROMA_PERSIST_DIR", DEFAULT_CHROMA_DIR)
+            return Chroma.from_documents(
+                documents=documents,
+                embedding=embeddings,
+                persist_directory=persist_dir,
+            )
+        except Exception as exc:
+            logger.warning("Chroma backend unavailable (%s); falling back.", exc)
+            return None
+
+    if backend == "faiss":
+        try:
+            from langchain_community.vectorstores import FAISS
+
+            return FAISS.from_documents(documents=documents, embedding=embeddings)
+        except Exception as exc:
+            logger.warning("FAISS backend unavailable (%s); falling back.", exc)
+            return None
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Lightweight in-memory retriever (numpy cosine similarity)
+# ---------------------------------------------------------------------------
+class _InMemoryRetriever:
+    """Numpy-based cosine similarity retriever over chunk embeddings."""
+
+    def __init__(self, embeddings: Embeddings, documents: list[Document]) -> None:
+        import numpy as np
+
+        self._np = np
+        self.embeddings = embeddings
+        self.documents = documents
+
+        if documents:
+            vectors = embeddings.embed_documents([d.page_content for d in documents])
+            self._matrix = np.array(vectors, dtype="float32")
+            norms = np.linalg.norm(self._matrix, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            self._matrix = self._matrix / norms
+        else:
+            self._matrix = np.zeros((0, 0), dtype="float32")
+
+    def get_relevant_documents(
+        self, query: str, top_k: int = 4
+    ) -> list[Document]:
+        if len(self.documents) == 0:
+            return []
+        q_vec = self._np.array(self.embeddings.embed_query(query), dtype="float32")
+        norm = self._np.linalg.norm(q_vec)
+        if norm == 0:
+            return list(self.documents[:top_k])
+        q_vec = q_vec / norm
+        scores = self._matrix @ q_vec
+        order = self._np.argsort(-scores)[:top_k]
+        return [self.documents[int(i)] for i in order]
+
+
+# ---------------------------------------------------------------------------
+# Prompt
+# ---------------------------------------------------------------------------
+QA_SYSTEM = (
+    "You are a careful document research assistant. Answer the user's question "
+    "using ONLY the provided context. Cite the source filenames you used. If "
+    "the context does not contain the answer, say you don't have enough "
+    "information."
+)
+
+QA_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        ("system", QA_SYSTEM),
+        (
+            "human",
+            "Context:\n{context}\n\nQuestion: {question}\n\n"
+            "Answer concisely and cite sources by filename.",
+        ),
+    ]
+)
+
+
+# ---------------------------------------------------------------------------
+# Main chain
+# ---------------------------------------------------------------------------
 class DocumentQAChain:
-    """Chain for document-based question answering."""
+    """LCEL retrieval-augmented QA chain over the in-process document store."""
 
-    QA_PROMPT = """Answer the question based ONLY on the following context.
-If you cannot answer from the context, say "I don't have enough information to answer this question."
-
-Context:
-{context}
-
-Question: {question}
-
-Instructions:
-1. Provide a clear, concise answer
-2. Quote relevant parts of the context when appropriate
-3. If the answer is uncertain, indicate your confidence level
-4. List which sources you used
-
-Answer:"""
-
-    def __init__(self, llm=None):
+    def __init__(self, llm: BaseChatModel | None = None) -> None:
         self.llm = llm
-        self.prompt = PromptTemplate.from_template(self.QA_PROMPT)
+        self.backend = _resolve_backend()
+        self.embeddings = _resolve_embeddings(self.backend)
 
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
     def answer(
         self,
         question: str,
-        document_id: Optional[str] = None,
-        top_k: int = 5
+        document_id: str | None = None,
+        top_k: int = 4,
     ) -> QAResult:
-        """Answer a question using document context."""
-
-        # Retrieve relevant chunks
-        chunks = document_store.search_chunks(question, top_k=top_k, doc_id=document_id)
-
-        if not chunks:
+        """Run retrieval then synthesis."""
+        documents = self._collect_documents(document_id)
+        if not documents:
             return QAResult(
                 question=question,
-                answer="No relevant documents found to answer this question.",
+                answer="No documents have been uploaded yet.",
                 confidence=0.0,
-                sources=[]
+                sources=[],
             )
 
-        # Build context from chunks
-        context_parts = []
-        sources = []
-
-        for chunk in chunks:
-            doc = document_store.get_document(chunk.document_id)
-            source_info = {
-                "document": doc.metadata.filename if doc else "Unknown",
-                "page": chunk.page_number,
-                "chunk_id": chunk.chunk_id
-            }
-            sources.append(source_info)
-
-            context_parts.append(
-                f"[Source: {source_info['document']}, Page {source_info['page']}]\n{chunk.content}"
+        retrieved = self._retrieve(question, documents, top_k=top_k)
+        if not retrieved:
+            return QAResult(
+                question=question,
+                answer="I couldn't find relevant content to answer this question.",
+                confidence=0.1,
+                sources=[],
             )
 
-        context = "\n\n---\n\n".join(context_parts)
-
-        # Generate answer
-        if self.llm:
-            # Use LLM for sophisticated answer
-            formatted_prompt = self.prompt.format(context=context, question=question)
-            answer = self.llm.invoke(formatted_prompt)
-            confidence = 0.8
+        sources = self._format_sources(retrieved)
+        if self.llm is not None:
+            answer_text = self._invoke_llm(question, retrieved)
+            confidence = 0.85
         else:
-            # Extractive answer without LLM
-            answer, confidence = self._extractive_answer(question, context)
+            answer_text, confidence = self._extractive_answer(
+                question, [d.page_content for d in retrieved]
+            )
 
         return QAResult(
             question=question,
-            answer=answer,
+            answer=answer_text,
             confidence=confidence,
-            sources=sources
+            sources=sources,
         )
 
-    def _extractive_answer(self, question: str, context: str) -> tuple:
-        """Generate extractive answer without LLM."""
-
-        # Extract question keywords
-        question_words = [w.lower() for w in question.split() if len(w) > 3]
-
-        # Handle different question types
-        if any(w in question.lower() for w in ['what is', 'what are', 'define']):
-            return self._answer_definition(question_words, context)
-        elif any(w in question.lower() for w in ['how many', 'how much', 'count']):
-            return self._answer_quantity(question_words, context)
-        elif any(w in question.lower() for w in ['when', 'what time', 'what date']):
-            return self._answer_temporal(context)
-        elif any(w in question.lower() for w in ['where', 'location', 'place']):
-            return self._answer_location(context)
-        elif any(w in question.lower() for w in ['why', 'reason', 'because']):
-            return self._answer_reason(question_words, context)
-        elif any(w in question.lower() for w in ['who', 'person', 'people']):
-            return self._answer_person(context)
-        else:
-            return self._answer_general(question_words, context)
-
-    def _answer_definition(self, keywords: List[str], context: str) -> tuple:
-        """Answer definition questions."""
-        sentences = re.split(r'[.!?]+', context)
-
-        # Look for definition patterns
-        definition_patterns = [
-            r'(.+?)\s+is\s+(.+)',
-            r'(.+?)\s+refers to\s+(.+)',
-            r'(.+?)\s+means\s+(.+)',
-            r'(.+?)\s+are\s+(.+)',
-        ]
-
-        for sentence in sentences:
-            for pattern in definition_patterns:
-                match = re.search(pattern, sentence, re.IGNORECASE)
-                if match:
-                    # Check if keywords are in the sentence
-                    if any(kw in sentence.lower() for kw in keywords):
-                        return sentence.strip(), 0.7
-
-        # Fallback to most relevant sentence
-        return self._find_most_relevant_sentence(keywords, sentences)
-
-    def _answer_quantity(self, keywords: List[str], context: str) -> tuple:
-        """Answer quantity questions."""
-        sentences = re.split(r'[.!?]+', context)
-
-        # Look for numbers
-        for sentence in sentences:
-            if any(kw in sentence.lower() for kw in keywords):
-                numbers = re.findall(r'\b\d+(?:,\d{3})*(?:\.\d+)?\b', sentence)
-                if numbers:
-                    return sentence.strip(), 0.7
-
-        return self._find_most_relevant_sentence(keywords, sentences)
-
-    def _answer_temporal(self, context: str) -> tuple:
-        """Answer time-related questions."""
-        # Look for date patterns
-        date_patterns = [
-            r'\d{4}-\d{2}-\d{2}',
-            r'\d{1,2}/\d{1,2}/\d{2,4}',
-            r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}',
-            r'\d{4}',
-        ]
-
-        sentences = re.split(r'[.!?]+', context)
-
-        for sentence in sentences:
-            for pattern in date_patterns:
-                if re.search(pattern, sentence):
-                    return sentence.strip(), 0.6
-
-        return "I couldn't find specific date information in the documents.", 0.3
-
-    def _answer_location(self, context: str) -> tuple:
-        """Answer location questions."""
-        sentences = re.split(r'[.!?]+', context)
-
-        location_indicators = ['in', 'at', 'located', 'based', 'headquarters', 'office']
-
-        for sentence in sentences:
-            if any(ind in sentence.lower() for ind in location_indicators):
-                # Check for capitalized words (likely locations)
-                caps = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', sentence)
-                if caps:
-                    return sentence.strip(), 0.6
-
-        return "I couldn't find specific location information in the documents.", 0.3
-
-    def _answer_reason(self, keywords: List[str], context: str) -> tuple:
-        """Answer 'why' questions."""
-        sentences = re.split(r'[.!?]+', context)
-
-        reason_indicators = ['because', 'due to', 'since', 'as a result', 'therefore', 'thus']
-
-        for sentence in sentences:
-            if any(ind in sentence.lower() for ind in reason_indicators):
-                if any(kw in sentence.lower() for kw in keywords):
-                    return sentence.strip(), 0.6
-
-        return self._find_most_relevant_sentence(keywords, sentences)
-
-    def _answer_person(self, context: str) -> tuple:
-        """Answer 'who' questions."""
-        # Look for person names (two capitalized words)
-        persons = re.findall(r'\b[A-Z][a-z]+\s+[A-Z][a-z]+\b', context)
-
-        if persons:
-            # Find sentence containing first person mentioned
-            sentences = re.split(r'[.!?]+', context)
-            for sentence in sentences:
-                if persons[0] in sentence:
-                    return sentence.strip(), 0.6
-
-        return "I couldn't identify specific people in the documents.", 0.3
-
-    def _answer_general(self, keywords: List[str], context: str) -> tuple:
-        """General answer extraction."""
-        sentences = re.split(r'[.!?]+', context)
-        return self._find_most_relevant_sentence(keywords, sentences)
-
-    def _find_most_relevant_sentence(
-        self,
-        keywords: List[str],
-        sentences: List[str]
-    ) -> tuple:
-        """Find most relevant sentence based on keyword overlap."""
-        scored = []
-
-        for sentence in sentences:
-            if len(sentence.strip()) < 20:
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _collect_documents(self, document_id: str | None) -> list[Document]:
+        """Build LangChain ``Document`` list from the in-memory store."""
+        documents: list[Document] = []
+        for chunk in document_store.chunks.values():
+            if document_id and chunk.document_id != document_id:
                 continue
+            stored = document_store.get_document(chunk.document_id)
+            filename = stored.metadata.filename if stored else "unknown"
+            documents.append(
+                Document(
+                    page_content=chunk.content,
+                    metadata={
+                        "document_id": chunk.document_id,
+                        "filename": filename,
+                        "page": chunk.page_number,
+                        "chunk_id": chunk.chunk_id,
+                    },
+                )
+            )
+        return documents
+
+    def _retrieve(
+        self, query: str, documents: list[Document], top_k: int
+    ) -> list[Document]:
+        backend = self.backend
+        store = _build_vector_store(documents, self.embeddings, backend) if backend in {
+            "chroma",
+            "faiss",
+        } else None
+
+        if store is not None:
+            return store.similarity_search(query, k=top_k)
+
+        retriever = _InMemoryRetriever(self.embeddings, documents)
+        return retriever.get_relevant_documents(query, top_k=top_k)
+
+    def _format_sources(self, documents: list[Document]) -> list[dict[str, Any]]:
+        sources: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for doc in documents:
+            key = f"{doc.metadata.get('document_id')}::{doc.metadata.get('chunk_id')}"
+            if key in seen:
+                continue
+            seen.add(key)
+            sources.append(
+                {
+                    "document": doc.metadata.get("filename", "unknown"),
+                    "document_id": doc.metadata.get("document_id"),
+                    "page": doc.metadata.get("page", 1),
+                    "chunk_id": doc.metadata.get("chunk_id"),
+                    "excerpt": (
+                        doc.page_content[:200] + "..."
+                        if len(doc.page_content) > 200
+                        else doc.page_content
+                    ),
+                }
+            )
+        return sources
+
+    def _invoke_llm(self, question: str, documents: list[Document]) -> str:
+        """Run the LCEL pipe: context -> prompt -> llm -> parser."""
+
+        def _format(_inp: dict[str, Any]) -> str:
+            parts = []
+            for doc in documents:
+                fname = doc.metadata.get("filename", "unknown")
+                page = doc.metadata.get("page", 1)
+                parts.append(f"[Source: {fname}, page {page}]\n{doc.page_content}")
+            return "\n\n---\n\n".join(parts)
+
+        chain = (
+            {
+                "context": RunnableLambda(_format),
+                "question": RunnablePassthrough(),
+            }
+            | QA_PROMPT
+            | self.llm
+            | StrOutputParser()
+        )
+        return chain.invoke(question)
+
+    # ------------------------------------------------------------------
+    # Keyword extractive fallback (no LLM available)
+    # ------------------------------------------------------------------
+    def _extractive_answer(
+        self, question: str, contexts: list[str]
+    ) -> tuple[str, float]:
+        joined = "\n\n".join(contexts)
+        keywords = [w.lower() for w in question.split() if len(w) > 3]
+        sentences = [s.strip() for s in re.split(r"[.!?]+", joined) if len(s.strip()) > 15]
+
+        scored: list[tuple[int, str]] = []
+        for sentence in sentences:
             score = sum(1 for kw in keywords if kw in sentence.lower())
             if score > 0:
-                scored.append((score, sentence.strip()))
+                scored.append((score, sentence))
 
-        if scored:
-            scored.sort(key=lambda x: x[0], reverse=True)
-            best = scored[0]
-            confidence = min(0.8, best[0] / max(len(keywords), 1))
-            return best[1], confidence
+        if not scored:
+            return ("I couldn't find a specific answer in the documents.", 0.2)
 
-        return "I couldn't find a specific answer in the documents.", 0.2
-
-
-class MultiHopQAChain:
-    """Chain for multi-hop question answering."""
-
-    def __init__(self, llm=None):
-        self.llm = llm
-        self.base_qa = DocumentQAChain(llm=llm)
-
-    def answer(
-        self,
-        question: str,
-        document_id: Optional[str] = None,
-        max_hops: int = 3
-    ) -> QAResult:
-        """Answer complex questions with multiple retrieval steps."""
-
-        # Decompose question into sub-questions
-        sub_questions = self._decompose_question(question)
-
-        all_sources = []
-        intermediate_answers = []
-
-        # Answer each sub-question
-        for sub_q in sub_questions[:max_hops]:
-            result = self.base_qa.answer(sub_q, document_id)
-            intermediate_answers.append({
-                "question": sub_q,
-                "answer": result.answer
-            })
-            all_sources.extend(result.sources)
-
-        # Synthesize final answer
-        if len(intermediate_answers) > 1:
-            final_answer = self._synthesize_answer(question, intermediate_answers)
-        else:
-            final_answer = intermediate_answers[0]["answer"] if intermediate_answers else "No answer found."
-
-        # Deduplicate sources
-        unique_sources = []
-        seen = set()
-        for source in all_sources:
-            key = f"{source['document']}_{source['page']}"
-            if key not in seen:
-                seen.add(key)
-                unique_sources.append(source)
-
-        return QAResult(
-            question=question,
-            answer=final_answer,
-            confidence=0.7 if intermediate_answers else 0.2,
-            sources=unique_sources,
-            reasoning=str(intermediate_answers) if len(intermediate_answers) > 1 else None
-        )
-
-    def _decompose_question(self, question: str) -> List[str]:
-        """Decompose complex question into simpler sub-questions."""
-        sub_questions = [question]
-
-        # Check for compound questions
-        if ' and ' in question.lower():
-            parts = question.split(' and ')
-            if len(parts) >= 2:
-                sub_questions = [p.strip() + '?' for p in parts]
-
-        # Check for comparison questions
-        elif 'compare' in question.lower() or 'difference' in question.lower():
-            # Extract entities being compared
-            match = re.search(r'between\s+(.+?)\s+and\s+(.+?)[\?\.]?$', question, re.IGNORECASE)
-            if match:
-                entity1, entity2 = match.groups()
-                sub_questions = [
-                    f"What is {entity1.strip()}?",
-                    f"What is {entity2.strip()}?",
-                    question
-                ]
-
-        return sub_questions
-
-    def _synthesize_answer(
-        self,
-        original_question: str,
-        intermediate_answers: List[Dict[str, str]]
-    ) -> str:
-        """Synthesize final answer from intermediate answers."""
-
-        # Simple concatenation synthesis
-        parts = []
-        for ia in intermediate_answers:
-            if "I couldn't find" not in ia["answer"]:
-                parts.append(ia["answer"])
-
-        if parts:
-            return " Additionally, ".join(parts)
-        else:
-            return "I couldn't find enough information to fully answer this question."
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top = [s for _, s in scored[:2]]
+        confidence = min(0.7, scored[0][0] / max(len(keywords), 1))
+        return (". ".join(top) + ".", round(confidence, 2))
 
 
-class ConversationalQAChain:
-    """Chain for conversational question answering with memory."""
-
-    def __init__(self, llm=None):
-        self.llm = llm
-        self.base_qa = DocumentQAChain(llm=llm)
-        self.conversation_history: List[Dict[str, str]] = []
-        self.max_history = 5
-
-    def answer(
-        self,
-        question: str,
-        document_id: Optional[str] = None
-    ) -> QAResult:
-        """Answer question with conversation context."""
-
-        # Resolve pronouns and references
-        resolved_question = self._resolve_references(question)
-
-        # Get answer
-        result = self.base_qa.answer(resolved_question, document_id)
-
-        # Update history
-        self.conversation_history.append({
-            "question": question,
-            "resolved_question": resolved_question,
-            "answer": result.answer
-        })
-
-        # Trim history
-        if len(self.conversation_history) > self.max_history:
-            self.conversation_history = self.conversation_history[-self.max_history:]
-
-        return result
-
-    def _resolve_references(self, question: str) -> str:
-        """Resolve pronouns and references using conversation history."""
-
-        if not self.conversation_history:
-            return question
-
-        # Common reference patterns
-        reference_words = ['it', 'this', 'that', 'they', 'them', 'these', 'those']
-
-        question_lower = question.lower()
-
-        # Check if question contains references
-        has_reference = any(f' {ref} ' in f' {question_lower} ' for ref in reference_words)
-
-        if not has_reference:
-            return question
-
-        # Get the most recent topic from history
-        recent = self.conversation_history[-1]
-        recent_question = recent.get("resolved_question", recent.get("question", ""))
-
-        # Extract potential noun phrases from recent question
-        # Simple heuristic: get capitalized words or quoted phrases
-        nouns = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', recent_question)
-
-        if nouns:
-            # Replace 'it' with the first noun found
-            topic = nouns[0]
-            resolved = question
-
-            for ref in reference_words:
-                pattern = rf'\b{ref}\b'
-                resolved = re.sub(pattern, topic, resolved, flags=re.IGNORECASE)
-
-            return resolved
-
-        return question
-
-    def clear_history(self):
-        """Clear conversation history."""
-        self.conversation_history = []
-
-    def get_history(self) -> List[Dict[str, str]]:
-        """Get conversation history."""
-        return self.conversation_history.copy()
-
-
-def create_qa_chain(llm=None, chain_type: str = "simple") -> Any:
-    """Factory function to create QA chains."""
-    chains = {
-        "simple": DocumentQAChain,
-        "multi_hop": MultiHopQAChain,
-        "conversational": ConversationalQAChain
-    }
-
-    chain_class = chains.get(chain_type, DocumentQAChain)
-    return chain_class(llm=llm)
+def create_qa_chain(llm: BaseChatModel | None = None) -> DocumentQAChain:
+    """Factory function to create a QA chain."""
+    return DocumentQAChain(llm=llm)
