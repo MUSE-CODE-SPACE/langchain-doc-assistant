@@ -4,7 +4,7 @@ LangChain-powered intelligent document processing and Q&A system with RAG.
 
 ## Live Demo
 
-[**View Demo**](https://yoon-k.github.io/langchain-doc-assistant/)
+[**View Demo**](https://MUSE-CODE-SPACE.github.io/langchain-doc-assistant/)
 
 ## Features
 
@@ -22,7 +22,7 @@ LangChain-powered intelligent document processing and Q&A system with RAG.
 ```
 langchain-doc-assistant/
 ├── app/
-│   ├── agents/document_agent.py     # LCEL tool-calling agent + fallback
+│   ├── agents/document_agent.py     # `create_agent` tool-calling agent + fallback
 │   ├── chains/qa_chain.py           # LCEL RAG pipeline + vector backends
 │   ├── processors/document_processor.py  # PDF / DOCX / TXT / MD / CSV / XLSX / HTML
 │   ├── tools/document_tools.py      # BaseTool subclasses with args_schema
@@ -83,9 +83,9 @@ Copy `.env.example` to `.env` and fill in any values you need:
 |----------|---------|-------------|
 | `LLM_PROVIDER` | auto-detect | `anthropic`, `openai`, or `none` |
 | `ANTHROPIC_API_KEY` | — | Required for `anthropic` provider |
-| `ANTHROPIC_MODEL` | `claude-haiku-4-5-20251001` | Override model |
+| `ANTHROPIC_MODEL` | `claude-haiku-5-5` | Override model |
 | `OPENAI_API_KEY` | — | Required for `openai` provider |
-| `OPENAI_MODEL` | `gpt-4o-mini` | Override model |
+| `OPENAI_MODEL` | `gpt-5.4-mini` | Override model |
 | `VECTOR_STORE` | `in_memory` | `in_memory`, `chroma`, `faiss` |
 | `CHROMA_PERSIST_DIR` | `./chroma_db` | Where Chroma writes |
 | `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | sentence-transformers model |
@@ -125,7 +125,7 @@ CI (GitHub Actions) installs the base `[dev]` extras (no `[rag]`) and runs
 
 ## Tech Stack
 
-- **LangChain 0.3** (`langchain`, `langchain-core`, `langchain-community`)
+- **LangChain 1.x** (`langchain`, `langchain-core`, `langgraph`)
 - **LLMs**: `langchain-anthropic`, `langchain-openai`
 - **Vector stores**: in-memory cosine (numpy), `langchain-chroma`, FAISS (optional)
 - **Embeddings**: `FakeEmbeddings` (default) or HuggingFace sentence-transformers
