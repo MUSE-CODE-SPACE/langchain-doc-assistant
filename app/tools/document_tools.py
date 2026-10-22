@@ -2,7 +2,7 @@
 Document Tools - LangChain tools for document operations.
 
 Each tool is a ``langchain_core.tools.BaseTool`` subclass with an explicit
-``args_schema`` (pydantic) so the LCEL ``create_tool_calling_agent`` can wire
+``args_schema`` (pydantic) so LangChain's ``create_agent`` can wire
 them up cleanly.
 """
 

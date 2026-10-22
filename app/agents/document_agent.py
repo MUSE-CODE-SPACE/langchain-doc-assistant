@@ -4,7 +4,7 @@ Document Agent - LangChain agent for document research.
 Supports two execution modes:
 
 1. LLM-backed mode (preferred): an Anthropic or OpenAI chat model wired up via
-   LangChain's LCEL ``create_tool_calling_agent`` + ``AgentExecutor``. The agent
+   LangChain 1.x ``create_agent`` (a LangGraph tool-calling loop). The agent
    can call the document tools (search, query, summarize, extract entities,
    compare). Selected automatically when an API key is present.
 2. Keyword router fallback: zero-dependency rule-based responder that uses the
@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import AIMessage
 
 from app.chains.qa_chain import DocumentQAChain
 from app.processors.document_processor import DocumentProcessorFactory
@@ -41,8 +41,24 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
-DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+# Upper bound on model -> tool round-trips per user turn (mirrors the old
+# ``AgentExecutor(max_iterations=...)``). Each round-trip is two graph steps.
+MAX_AGENT_STEPS = 6
+
+
+def extract_final_text(result: Any) -> str:
+    """Return the text of the last assistant message in a ``create_agent`` result."""
+    messages = result.get("messages") if isinstance(result, dict) else None
+    if not messages:
+        return ""
+    last = messages[-1]
+    if not isinstance(last, AIMessage):
+        return ""
+    return str(last.text).strip()
+
+
+DEFAULT_ANTHROPIC_MODEL = "claude-haiku-5-5"
+DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
 
 
 @dataclass
@@ -88,7 +104,7 @@ def _resolve_llm() -> BaseChatModel | None:
             from langchain_anthropic import ChatAnthropic
 
             model = os.environ.get("ANTHROPIC_MODEL", DEFAULT_ANTHROPIC_MODEL)
-            return ChatAnthropic(model=model, temperature=0.2)
+            return ChatAnthropic(model=model, max_tokens=4096)
 
         if provider == "openai":
             if not has_openai:
@@ -97,7 +113,7 @@ def _resolve_llm() -> BaseChatModel | None:
             from langchain_openai import ChatOpenAI
 
             model = os.environ.get("OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
-            return ChatOpenAI(model=model, temperature=0.2)
+            return ChatOpenAI(model=model)
     except Exception as exc:
         logger.warning("Failed to construct LLM for provider %s: %s", provider, exc)
         return None
@@ -251,51 +267,36 @@ Guidelines:
     # LLM-backed agent plumbing
     # ------------------------------------------------------------------
     def _build_agent_executor(self) -> Any:
-        from langchain.agents import AgentExecutor, create_tool_calling_agent
+        """Construct a LangGraph tool-calling agent (LangChain 1.x ``create_agent``)."""
+        # Imported lazily so we only require these when an LLM is configured.
+        from langchain.agents import create_agent
 
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                ("system", self.SYSTEM_PROMPT),
-                MessagesPlaceholder("chat_history", optional=True),
-                ("human", "{input}"),
-                MessagesPlaceholder("agent_scratchpad"),
-            ]
-        )
-        agent = create_tool_calling_agent(self.llm, self.tools, prompt)
-        return AgentExecutor(
-            agent=agent,
-            tools=self.tools,
-            verbose=self.verbose,
-            max_iterations=6,
-            handle_parsing_errors=True,
+        return create_agent(
+            self.llm,
+            self.tools,
+            system_prompt=self.SYSTEM_PROMPT,
+            debug=self.verbose,
         )
 
     def _build_chat_history_messages(self) -> list[tuple[str, str]]:
+        """Return prior turns as LangChain ``(role, content)`` message tuples."""
+        # Skip the most recent user turn (it is appended as the final human message).
         history = list(self._recent_turns)[:-1]
         return [
             ("human" if role == "user" else "ai", content) for role, content in history
         ]
 
     def _generate_response(self, message: str) -> str:
+        """Dispatch to LLM-backed agent or keyword router."""
         if self._agent_executor is None:
             return self._keyword_response(message)
 
         result = self._agent_executor.invoke(
-            {
-                "input": message,
-                "chat_history": self._build_chat_history_messages(),
-            }
+            {"messages": [*self._build_chat_history_messages(), ("human", message)]},
+            config={"recursion_limit": 2 * MAX_AGENT_STEPS + 1},
         )
-        output = result.get("output")
-        if isinstance(output, list):
-            parts: list[str] = []
-            for block in output:
-                if isinstance(block, dict) and "text" in block:
-                    parts.append(str(block["text"]))
-                else:
-                    parts.append(str(block))
-            return "\n".join(parts).strip() or self._keyword_response(message)
-        if isinstance(output, str) and output.strip():
+        output = extract_final_text(result)
+        if output:
             return output
         return self._keyword_response(message)
 

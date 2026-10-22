@@ -9,11 +9,12 @@ The retriever is backed by one of three vector store implementations, selected
 via the ``VECTOR_STORE`` env var (default ``in_memory``):
 
 * ``in_memory`` - numpy-based cosine similarity over chunk vectors. Uses
-  ``FakeEmbeddings`` so no ML model is required; perfect for tests.
+  ``langchain_core``'s ``FakeEmbeddings`` so no ML model is required; perfect
+  for tests.
 * ``chroma`` - persisted ``langchain_chroma.Chroma`` collection (optional
   ``[rag]`` extras).
 * ``faiss`` - ``langchain_community.vectorstores.FAISS`` (optional ``[rag]``
-  extras + ``faiss-cpu``).
+  extras: ``langchain-community`` + ``faiss-cpu``).
 
 When no LLM is configured, the chain falls back to an extractive keyword-based
 answerer so the chain still returns useful results in tests and offline demos.
@@ -28,6 +29,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from langchain_core.documents import Document
+from langchain_core.embeddings import FakeEmbeddings
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableLambda, RunnablePassthrough
@@ -72,13 +74,12 @@ def _resolve_embeddings(backend: str) -> Embeddings:
     """Construct an embeddings object appropriate for the backend."""
     # in_memory uses FakeEmbeddings so tests don't need to download models.
     if backend == "in_memory":
-        from langchain_community.embeddings import FakeEmbeddings
-
         return FakeEmbeddings(size=64)
 
-    # For real backends, prefer sentence-transformers when available.
+    # For real backends, prefer sentence-transformers when available
+    # (``langchain-huggingface`` ships with the optional ``[rag]`` extras).
     try:
-        from langchain_community.embeddings import HuggingFaceEmbeddings
+        from langchain_huggingface import HuggingFaceEmbeddings
 
         model_name = os.environ.get("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
         return HuggingFaceEmbeddings(model_name=model_name)
@@ -86,8 +87,6 @@ def _resolve_embeddings(backend: str) -> Embeddings:
         logger.warning(
             "HuggingFaceEmbeddings unavailable (%s); using FakeEmbeddings.", exc
         )
-        from langchain_community.embeddings import FakeEmbeddings
-
         return FakeEmbeddings(size=64)
 
 
